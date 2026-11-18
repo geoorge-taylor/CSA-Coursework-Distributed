@@ -3,6 +3,7 @@ package gol
 import (
 	"fmt"
 	"net/rpc"
+	"time"
 
 	"uk.ac.bris.cs/gameoflife/stubs"
 )
@@ -46,6 +47,26 @@ func distributor(p Params, c distributorChannels) {
 	}
 	defer client.Close()
 
+	done := make(chan bool) // unbuffered
+
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				res := new(stubs.CountAliveCellsResponse)
+				if err := client.Call(stubs.CountAliveCellsHandler, stubs.CountAliveCellsRequest{}, res); err != nil {
+					return
+				}
+				c.events <- AliveCellsCount{CompletedTurns: res.CompletedTurns, CellsCount: res.CellsCount}
+			}
+		}
+	}()
+
 	// build request
 	request := stubs.ProcessTurnsRequest{
 		World:       world,
@@ -62,6 +83,8 @@ func distributor(p Params, c distributorChannels) {
 	if err != nil {
 		panic(err)
 	}
+
+	done <- true // blocks until the ticker goroutine receives it
 
 	// extract
 	completedTurns := response.CompletedTurns

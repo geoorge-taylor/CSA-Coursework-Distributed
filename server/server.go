@@ -5,12 +5,19 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
+	"sync"
 
 	"uk.ac.bris.cs/gameoflife/stubs"
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-type GolWorker struct{}
+type GolWorker struct {
+	mu     sync.Mutex
+	world  [][]byte
+	turn   int
+	width  int
+	height int
+}
 
 func countliveneighbours(world [][]byte, width, height, row, column int) int {
 	count := 0
@@ -36,6 +43,7 @@ func countliveneighbours(world [][]byte, width, height, row, column int) int {
 			if world[newHeight][newWidth] == 255 {
 				count++
 			}
+
 		}
 	}
 	return count
@@ -77,20 +85,36 @@ func aliveCells(world [][]byte) []util.Cell {
 	return cells
 }
 
+func (g *GolWorker) CountAliveCells(req stubs.CountAliveCellsRequest, res *stubs.CountAliveCellsResponse) (err error) {
+	g.mu.Lock()
+	currentWorld := g.world
+	completedTurns := g.turn
+	g.mu.Unlock()
+
+	res.CellsCount = len(aliveCells(currentWorld))
+	res.CompletedTurns = completedTurns
+	return
+}
+
 // Receive the world from the local controller, evolve it for the requested number of turns and send back the result
 func (g *GolWorker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessTurnsResponse) (err error) {
-	// nothing else reads the world while this runs, so local variables are enough
-	world := req.World
-	turn := 0
+	g.mu.Lock()
+	g.world = req.World
+	g.turn = 0
+	g.width, g.height = req.ImageWidth, req.ImageHeight
+	g.mu.Unlock()
 
 	for t := 0; t < req.Turns; t++ {
-		world = executeTurn(world, req.ImageWidth, req.ImageHeight)
-		turn++
+		newWorld := executeTurn(g.world, req.ImageWidth, req.ImageHeight)
+		g.mu.Lock()
+		g.world = newWorld
+		g.turn++
+		g.mu.Unlock()
 	}
 
-	res.World = world
-	res.CompletedTurns = turn
-	res.AliveCells = aliveCells(world)
+	res.World = g.world
+	res.CompletedTurns = g.turn
+	res.AliveCells = aliveCells(g.world)
 	fmt.Println("Processed all turns on the server")
 	return
 }
