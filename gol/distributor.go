@@ -1,6 +1,7 @@
 package gol
 
 import (
+	"flag"
 	"fmt"
 	"net/rpc"
 	"time"
@@ -17,6 +18,8 @@ type distributorChannels struct {
 	ioInput    <-chan uint8
 	keyPresses <-chan rune
 }
+
+var brokerAddr = flag.String("broker", "127.0.0.1:8030", "Address of broker instance")
 
 // distributor divides the work between workers and interacts with other goroutines.
 
@@ -57,9 +60,9 @@ func writeImage(p Params, c distributorChannels, world [][]byte, turn int) {
 	}
 }
 
-func getWorldFromServer(client *rpc.Client) (*stubs.GetWorldResponse, error) {
+func getWorldFromServer(broker *rpc.Client) (*stubs.GetWorldResponse, error) {
 	response := new(stubs.GetWorldResponse)
-	err := client.Call(stubs.GetWorldHandler, stubs.GetWorldRequest{}, response)
+	err := broker.Call(stubs.GetWorldHandler, stubs.GetWorldRequest{}, response)
 	return response, err
 }
 
@@ -68,11 +71,11 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
 
 	// connect, need to change to the AWS port when set up
-	client, err := rpc.Dial("tcp", "127.0.0.1:8030")
+	broker, err := rpc.Dial("tcp", *brokerAddr)
 	if err != nil {
 		panic(err)
 	}
-	defer client.Close()
+	defer broker.Close()
 
 	request := stubs.ProcessTurnsRequest{
 		World:       world,
@@ -83,7 +86,7 @@ func distributor(p Params, c distributorChannels) {
 	response := new(stubs.ProcessTurnsResponse)
 
 	// use go so we can listen to keys meanwhile
-	call := client.Go(stubs.ProcessTurnsHandler, request, response, nil)
+	call := broker.Go(stubs.ProcessTurnsHandler, request, response, nil)
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -96,7 +99,7 @@ func distributor(p Params, c distributorChannels) {
 		switch key {
 		case 's':
 			// TODO: GetWorld RPC -> writeImage(p, c, res.World, res.CompletedTurns)
-			response, err := getWorldFromServer(client)
+			response, err := getWorldFromServer(broker)
 			if err != nil || response.World == nil {
 				fmt.Println("could not get world from server:", err)
 				return // skip writing the image
@@ -107,15 +110,15 @@ func distributor(p Params, c distributorChannels) {
 			quitting = true // also need to skip final turn processed event
 			shutdown = true
 			response := new(stubs.StopProcessingResponse)
-			client.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
+			broker.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
 		case 'q':
 			// can re-use the logic from the <-call.Done part to ensure we fully wait for the server to stop processing before writing an image
 			quitting = true
 			response := new(stubs.StopProcessingResponse)
-			client.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
+			broker.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
 		case 'p':
 			res := new(stubs.TogglePauseResponse)
-			client.Call(stubs.TogglePauseHandler, stubs.TogglePauseRequest{}, res)
+			broker.Call(stubs.TogglePauseHandler, stubs.TogglePauseRequest{}, res)
 			lastTurn = res.CompletedTurns
 			if res.Paused {
 				fmt.Println(res.CompletedTurns)
@@ -148,7 +151,7 @@ func distributor(p Params, c distributorChannels) {
 			// but this is tedious as there could be actual errors that we are missing
 			if shutdown {
 				response := new(stubs.ShutdownResponse)
-				_ = client.Call(stubs.ShutDownRequestHandler, stubs.ShutdownRequest{}, response)
+				_ = broker.Call(stubs.ShutdownHandler, stubs.ShutdownRequest{}, response)
 			}
 
 			c.events <- StateChange{response.CompletedTurns, Quitting}
@@ -158,7 +161,7 @@ func distributor(p Params, c distributorChannels) {
 		case <-ticker.C:
 			// your existing CountAliveCells call + AliveCellsCount event moves here
 			res := new(stubs.CountAliveCellsResponse)
-			err := client.Call(stubs.CountAliveCellsHandler, stubs.CountAliveCellsRequest{}, res)
+			err := broker.Call(stubs.CountAliveCellsHandler, stubs.CountAliveCellsRequest{}, res)
 			lastTurn = res.CompletedTurns
 
 			if err != nil {

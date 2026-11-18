@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -11,78 +12,38 @@ import (
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-type GolWorker struct {
+// ---- Types and constants ----
+
+const alive byte = 255
+
+type Broker struct {
 	mu           sync.Mutex
 	cond         *sync.Cond
 	world        [][]byte
 	turn         int
-	width        int
 	height       int
 	quit         bool
 	paused       bool
 	shutdown     chan bool
 	shuttingDown bool
+	workers      []worker
 }
 
-func countliveneighbours(world [][]byte, width, height, row, column int) int {
-	count := 0
-	for i := -1; i < 2; i++ {
-		for j := -1; j < 2; j++ {
-			if i == 0 && j == 0 {
-				continue
-			}
-			newHeight := i + row
-			newWidth := j + column
-			if newHeight < 0 {
-				newHeight = height - 1
-			}
-			if newWidth < 0 {
-				newWidth = width - 1
-			}
-			if newHeight >= height {
-				newHeight = 0
-			}
-			if newWidth >= width {
-				newWidth = 0
-			}
-			if world[newHeight][newWidth] == 255 {
-				count++
-			}
-
-		}
-	}
-	return count
+type worker struct {
+	startY     int
+	endY       int
+	haloAbove  int
+	haloBelow  int
+	workerNode *rpc.Client
 }
 
-func executeTurn(world [][]byte, width, height int) [][]byte {
-	// make copy of world
-	// copilot suggestion: swap from nested for loop to inbuilt copy function to improve speed.
-
-	newWorld := make([][]byte, height)
-	for i := range newWorld {
-		newWorld[i] = make([]byte, width)
-		copy(newWorld[i], world[i])
-	}
-
-	// Loop through all cells and check whether it should be alive or dead
-	for i := 0; i < height; i++ {
-		for j := 0; j < width; j++ {
-			liveNeighbours := countliveneighbours(world, width, height, i, j)
-			if world[i][j] == 255 && (liveNeighbours < 2 || liveNeighbours > 3) {
-				newWorld[i][j] = 0
-			} else if world[i][j] == 0 && liveNeighbours == 3 {
-				newWorld[i][j] = 255
-			}
-		}
-	}
-	return newWorld
-}
+// ---- Helpers ----
 
 func aliveCells(world [][]byte) []util.Cell {
 	var cells []util.Cell
 	for y, row := range world {
 		for x, cell := range row {
-			if cell == 255 {
+			if cell == alive {
 				cells = append(cells, util.Cell{X: x, Y: y})
 			}
 		}
@@ -90,106 +51,194 @@ func aliveCells(world [][]byte) []util.Cell {
 	return cells
 }
 
-func (g *GolWorker) CountAliveCells(req stubs.CountAliveCellsRequest, res *stubs.CountAliveCellsResponse) (err error) {
-	g.mu.Lock()
-	currentWorld := g.world
-	completedTurns := g.turn
-	g.mu.Unlock()
+// ---- Internal methods ----
+
+func (b *Broker) addWorker(workerAddress string) (err error) {
+	workerNode, err := rpc.Dial("tcp", workerAddress)
+	if err != nil {
+		return err
+	}
+	newWorker := worker{workerNode: workerNode}
+	b.mu.Lock()
+	b.workers = append(b.workers, newWorker)
+	b.mu.Unlock()
+	return
+}
+
+func (b *Broker) assignStrips() {
+	n := len(b.workers)
+	for i := range b.workers {
+		startY := i * b.height / n
+		endY := (i + 1) * b.height / n
+
+		b.workers[i].startY = startY
+		b.workers[i].endY = endY
+		b.workers[i].haloAbove = (startY - 1 + b.height) % b.height // wraps to the last row
+		b.workers[i].haloBelow = endY % b.height                    // wraps to row 0
+	}
+}
+
+func (b *Broker) nextTurn(world [][]byte) [][]byte {
+	height := len(world)
+
+	// send every worker node its strip, with a halo row above and below
+	calls := make([]*rpc.Call, len(b.workers))
+	for i, w := range b.workers {
+		rows := make([][]byte, 0, w.endY-w.startY+2) // +2 for the halo rows
+		rows = append(rows, world[w.haloAbove])
+		rows = append(rows, world[w.startY:w.endY]...)
+		rows = append(rows, world[w.haloBelow])
+
+		job := stubs.StripJob{Rows: rows}
+		calls[i] = w.workerNode.Go(
+			stubs.CalculateStripHandler,
+			job,
+			new(stubs.StripResult),
+			nil,
+		)
+	}
+
+	// collect the strips in worker order, same as the parallel version
+	newWorld := make([][]byte, 0, height)
+	for _, call := range calls {
+		<-call.Done
+		if call.Error != nil {
+			fmt.Println("worker node failed:", call.Error)
+		}
+		strip := call.Reply.(*stubs.StripResult)
+		newWorld = append(newWorld, strip.Rows...)
+	}
+	return newWorld
+}
+
+// ---- RPC methods called by worker nodes ----
+
+func (b *Broker) Subscribe(req stubs.Subscription, res *stubs.StatusReport) (err error) {
+	err = b.addWorker(req.WorkerAddress)
+	if err != nil {
+		res.Message = "Failed to subscribe to worker"
+	}
+	return
+}
+
+// ---- RPC methods called by the local controller ----
+
+// Receive the world from the local controller, evolve it for the requested number of turns and send back the result
+func (b *Broker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessTurnsResponse) (err error) {
+	b.mu.Lock()
+	b.world = req.World
+	b.height = req.ImageHeight
+	if len(b.workers) == 0 {
+		b.mu.Unlock()
+		return errors.New("no worker nodes have subscribed")
+	}
+	b.assignStrips()
+	b.mu.Unlock()
+
+	for t := 0; t < req.Turns; t++ {
+		b.mu.Lock()
+		for b.paused && !b.quit {
+			// sleep this go routine but keep mutex unlocked
+			b.cond.Wait()
+		}
+		if b.quit {
+			b.mu.Unlock()
+			break
+		}
+		b.mu.Unlock()
+
+		newWorld := b.nextTurn(b.world)
+		b.mu.Lock()
+		b.world = newWorld
+		b.turn++
+		b.mu.Unlock()
+	}
+
+	b.mu.Lock()
+	finalWorld := b.world
+	finalTurn := b.turn
+	b.quit = false
+	b.paused = false
+	b.turn = 0
+	b.mu.Unlock()
+
+	res.World = finalWorld
+	res.CompletedTurns = finalTurn
+	res.AliveCells = aliveCells(finalWorld)
+	fmt.Println("Processed all turns on the server")
+	return
+}
+
+func (b *Broker) CountAliveCells(req stubs.CountAliveCellsRequest, res *stubs.CountAliveCellsResponse) (err error) {
+	b.mu.Lock()
+	currentWorld := b.world
+	completedTurns := b.turn
+	b.mu.Unlock()
 
 	res.CellsCount = len(aliveCells(currentWorld))
 	res.CompletedTurns = completedTurns
 	return
 }
 
-// Receive the world from the local controller, evolve it for the requested number of turns and send back the result
-func (g *GolWorker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessTurnsResponse) (err error) {
-	g.mu.Lock()
-	g.world = req.World
-	g.width, g.height = req.ImageWidth, req.ImageHeight
-	g.mu.Unlock()
-
-	for t := 0; t < req.Turns; t++ {
-		g.mu.Lock()
-		for g.paused && !g.quit {
-			// sleep this go routine but keep mutex unlocked
-			g.cond.Wait()
-		}
-		if g.quit {
-			g.mu.Unlock()
-			break
-		}
-		g.mu.Unlock()
-
-		newWorld := executeTurn(g.world, req.ImageWidth, req.ImageHeight)
-		g.mu.Lock()
-		g.world = newWorld
-		g.turn++
-		g.mu.Unlock()
-	}
-
-	g.mu.Lock()
-	finalWorld := g.world
-	finalTurn := g.turn
-	g.quit = false
-	g.paused = false
-	g.turn = 0
-	g.mu.Unlock()
-
-	res.World = finalWorld
-	res.CompletedTurns = finalTurn
-	res.AliveCells = aliveCells(g.world)
-	fmt.Println("Processed all turns on the server")
+func (b *Broker) GetWorld(req stubs.GetWorldRequest, res *stubs.GetWorldResponse) (err error) {
+	b.mu.Lock()
+	res.World = b.world
+	res.CompletedTurns = b.turn
+	b.mu.Unlock()
 	return
 }
 
-func (g *GolWorker) GetWorld(req stubs.GetWorldRequest, res *stubs.GetWorldResponse) (err error) {
-	g.mu.Lock()
-	res.World = g.world
-	res.CompletedTurns = g.turn
-	g.mu.Unlock()
+func (b *Broker) TogglePause(req stubs.TogglePauseRequest, res *stubs.TogglePauseResponse) (err error) {
+	b.mu.Lock()
+	b.paused = !b.paused
+	res.Paused = b.paused
+	res.CompletedTurns = b.turn
+	b.cond.Broadcast()
+	b.mu.Unlock()
 	return
 }
 
-func (g *GolWorker) StopProcessing(req stubs.StopProcessingRequest, res *stubs.StopProcessingResponse) (err error) {
-	g.mu.Lock()
-	g.quit = true
-	g.cond.Broadcast() // wake up paused loop to check if its paused again
-	g.mu.Unlock()
+func (b *Broker) StopProcessing(req stubs.StopProcessingRequest, res *stubs.StopProcessingResponse) (err error) {
+	b.mu.Lock()
+	b.quit = true
+	b.cond.Broadcast() // wake up paused loop to check if its paused again
+	b.mu.Unlock()
 	return
 }
 
-func (g *GolWorker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse) (err error) {
+func (b *Broker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse) (err error) {
 	// check that we are already shutting down so two key presses of k dont cause the client to hang waiting for a response
-	g.mu.Lock()
-	if g.shuttingDown {
-		g.mu.Unlock()
+	b.mu.Lock()
+	if b.shuttingDown {
+		b.mu.Unlock()
 		return
 	}
-	g.shuttingDown = true
-	g.mu.Unlock()
+	b.shuttingDown = true
+	workers := b.workers
+	b.mu.Unlock()
 
-	g.shutdown <- true
+	for _, w := range workers {
+		// the worker may exit before its reply arrives, so the error is ignored
+		w.workerNode.Call(stubs.WorkerShutdownHandler, stubs.ShutdownRequest{}, new(stubs.ShutdownResponse))
+		w.workerNode.Close()
+	}
+
+	b.shutdown <- true
 	return
 }
 
-func (g *GolWorker) TogglePause(req stubs.TogglePauseRequest, res *stubs.TogglePauseResponse) (err error) {
-	g.mu.Lock()
-	g.paused = !g.paused
-	res.Paused = g.paused
-	res.CompletedTurns = g.turn
-	g.cond.Broadcast()
-	g.mu.Unlock()
-	return
-}
+// ---- Entry point ----
 
 func main() {
 	// Listen on some address for local controller requests
 	pAddr := flag.String("port", ":8030", "Port to listen on")
 	flag.Parse()
 
-	worker := &GolWorker{shutdown: make(chan bool, 1)}
-	worker.cond = sync.NewCond(&worker.mu)
-	rpc.Register(worker)
+	broker := &Broker{
+		shutdown: make(chan bool, 1),
+	}
+	broker.cond = sync.NewCond(&broker.mu)
+	rpc.Register(broker)
 
 	listener, err := net.Listen("tcp", *pAddr)
 	if err != nil {
@@ -198,7 +247,5 @@ func main() {
 	defer listener.Close()
 
 	go rpc.Accept(listener)
-
-	<-worker.shutdown
-	listener.Close()
+	<-broker.shutdown
 }

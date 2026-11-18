@@ -2,38 +2,16 @@ package stubs
 
 import "uk.ac.bris.cs/gameoflife/util"
 
-var ProcessTurnsHandler = "GolWorker.ProcessTurns"
-var CountAliveCellsHandler = "GolWorker.CountAliveCells"
-var GetWorldHandler = "GolWorker.GetWorld"
-var StopProcessingHandler = "GolWorker.StopProcessing"
-var ShutDownRequestHandler = "GolWorker.Shutdown"
-var TogglePauseHandler = "GolWorker.TogglePause"
+// ---- Controller <-> broker ----
 
-type StopProcessingResponse struct{}
-type StopProcessingRequest struct{}
-type TogglePauseRequest struct{}
-
-type ShutdownRequest struct{}
-type ShutdownResponse struct{}
-
-type GetWorldRequest struct{}
-
-type TogglePauseResponse struct {
-	Paused         bool
-	CompletedTurns int
-}
-
-type GetWorldResponse struct {
-	World          [][]byte
-	CompletedTurns int
-}
-
-type CountAliveCellsRequest struct{}
-
-type CountAliveCellsResponse struct {
-	CellsCount     int
-	CompletedTurns int
-}
+const (
+	ProcessTurnsHandler    = "Broker.ProcessTurns"
+	CountAliveCellsHandler = "Broker.CountAliveCells"
+	GetWorldHandler        = "Broker.GetWorld"
+	TogglePauseHandler     = "Broker.TogglePause"
+	StopProcessingHandler  = "Broker.StopProcessing"
+	ShutdownHandler        = "Broker.Shutdown"
+)
 
 type ProcessTurnsRequest struct {
 	World       [][]byte
@@ -46,4 +24,65 @@ type ProcessTurnsResponse struct {
 	World          [][]byte
 	CompletedTurns int
 	AliveCells     []util.Cell
+}
+
+type CountAliveCellsRequest struct{}
+
+type CountAliveCellsResponse struct {
+	CellsCount     int
+	CompletedTurns int
+}
+
+type GetWorldRequest struct{}
+
+type GetWorldResponse struct {
+	World          [][]byte
+	CompletedTurns int
+}
+
+type TogglePauseRequest struct{}
+
+type TogglePauseResponse struct {
+	Paused         bool
+	CompletedTurns int
+}
+
+type StopProcessingRequest struct{}
+type StopProcessingResponse struct{}
+
+// Also used by the broker when it shuts down a worker node.
+type ShutdownRequest struct{}
+type ShutdownResponse struct{}
+
+// ---- Broker <-> worker node ----
+
+const (
+	// Called by a worker node on the broker to register itself.
+	SubscribeHandler = "Broker.Subscribe"
+
+	// The callback the broker invokes on a worker node for each strip.
+	CalculateStripHandler = "Worker.CalculateStrip"
+
+	// Called by the broker on a worker node to make it exit.
+	WorkerShutdownHandler = "Worker.Shutdown"
+)
+
+// Sent by a worker node to the broker when it starts up.
+type Subscription struct {
+	WorkerAddress string // address the broker should dial back, e.g. "172.31.0.5:8040"
+}
+
+type StatusReport struct {
+	Message string
+}
+
+// One strip of work. Rows holds the strip plus one extra row above and one below
+// (already wrapped by the broker), so len(Rows) is the strip height + 2.
+type StripJob struct {
+	Rows [][]byte
+}
+
+// The next state of a strip, without the two extra rows.
+type StripResult struct {
+	Rows [][]byte
 }
