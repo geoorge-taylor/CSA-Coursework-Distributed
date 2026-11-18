@@ -36,6 +36,27 @@ func loadWorld(p Params, c distributorChannels) [][]byte {
 	return world
 }
 
+func writeImage(p Params, c distributorChannels, world [][]byte, turn int) {
+	filename := fmt.Sprintf("%dx%dx%d", p.ImageWidth, p.ImageHeight, turn)
+
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for _, row := range world {
+		for _, cell := range row {
+			c.ioOutput <- cell
+		}
+	}
+
+	// Make sure that the Io has finished any output before carrying on.
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	c.events <- ImageOutputComplete{
+		CompletedTurns: turn,
+		Filename:       filename,
+	}
+}
+
 func distributor(p Params, c distributorChannels) {
 	world := loadWorld(p, c)
 	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
@@ -87,13 +108,11 @@ func distributor(p Params, c distributorChannels) {
 	done <- true // blocks until the ticker goroutine receives it
 
 	// extract
+	finalWorld := response.World
 	completedTurns := response.CompletedTurns
 
 	c.events <- FinalTurnComplete{CompletedTurns: completedTurns, Alive: response.AliveCells}
-
-	// Make sure that the Io has finished any output before exiting.
-	c.ioCommand <- ioCheckIdle
-	<-c.ioIdle
+	writeImage(p, c, finalWorld, completedTurns)
 
 	c.events <- StateChange{completedTurns, Quitting}
 
