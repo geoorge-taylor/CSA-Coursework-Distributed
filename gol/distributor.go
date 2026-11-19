@@ -10,6 +10,8 @@ import (
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
+const alive byte = 255
+
 type distributorChannels struct {
 	events     chan<- Event
 	ioCommand  chan<- ioCommand
@@ -20,11 +22,10 @@ type distributorChannels struct {
 	keyPresses <-chan rune
 }
 
+// flag needed to be put here at package level to fix error of flag being redefined when distributor was run many times
 var brokerAddr = flag.String("broker", "127.0.0.1:8030", "Address of broker instance")
 
-// distributor divides the work between workers and interacts with other goroutines.
 func loadWorld(p Params, c distributorChannels) [][]byte {
-	// Request initial image
 	c.ioCommand <- ioInput
 	c.ioFilename <- fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
 
@@ -43,7 +44,7 @@ func getInitialFlippedCells(world [][]byte) []util.Cell {
 	initial := []util.Cell{}
 	for y, row := range world {
 		for x, cell := range row {
-			if cell == 255 {
+			if cell == alive {
 				initial = append(initial, util.Cell{X: x, Y: y})
 			}
 		}
@@ -62,7 +63,7 @@ func writeImage(p Params, c distributorChannels, world [][]byte, turn int) {
 		}
 	}
 
-	// Make sure that the Io has finished any output before carrying on.
+	// make sure that the Io has finished any output before carrying on.
 	c.ioCommand <- ioCheckIdle
 	<-c.ioIdle
 
@@ -72,9 +73,9 @@ func writeImage(p Params, c distributorChannels, world [][]byte, turn int) {
 	}
 }
 
-func getWorldFromServer(broker *rpc.Client) (*stubs.GetWorldResponse, error) {
+func getWorldFromServer(broker *rpc.Client, gameID int64) (*stubs.GetWorldResponse, error) {
 	response := new(stubs.GetWorldResponse)
-	err := broker.Call(stubs.GetWorldHandler, stubs.GetWorldRequest{}, response)
+	err := broker.Call(stubs.GetWorldHandler, stubs.GameRequest{GameID: gameID}, response)
 	return response, err
 }
 
@@ -85,44 +86,53 @@ func distributor(p Params, c distributorChannels) {
 	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initial}
 	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
 
-	// connect, need to change to the AWS port when set up
 	broker, err := rpc.Dial("tcp", *brokerAddr)
 	if err != nil {
 		panic(err)
 	}
 	defer broker.Close()
 
-	// unique id for this game, so the broker can tell this controller's requests apart from an older one's
-	runID := time.Now().UnixNano()
-	request := stubs.ProcessTurnsRequest{
-		RunID:       runID,
+	// start a fresh game on the broker and get its id, this also stops any game an old controller left running
+	startResponse := new(stubs.StartGameResponse)
+	err = broker.Call(stubs.StartGameHandler, stubs.StartGameRequest{
 		World:       world,
 		ImageWidth:  p.ImageWidth,
 		ImageHeight: p.ImageHeight,
-		Turns:       p.Turns,
 		Threads:     p.Threads,
+	}, startResponse)
+
+	if err != nil {
+		fmt.Println("could not start game:", err)
+		c.events <- StateChange{0, Quitting}
+		close(c.events)
+		return
 	}
+
+	gameID := startResponse.GameID
+
+	request := stubs.ProcessTurnsRequest{GameID: gameID, Turns: p.Turns}
 	response := new(stubs.ProcessTurnsResponse)
 
-	// use go so we can listen to keys meanwhile
+	// use go so we can listen to keys meanwhile and also get turn updates
 	call := broker.Go(stubs.ProcessTurnsHandler, request, response, nil)
 
 	// start listening to get turn update requests and push the events onto the channels
+	// this is for the live sdl view extension
 	done := make(chan bool, 1)
 	go func() {
 		for {
 			res := new(stubs.GetTurnUpdatesResponse)
-			err := broker.Call(stubs.GetTurnUpdatesHandler, stubs.GetTurnUpdatesRequest{RunID: runID}, res)
+			err := broker.Call(stubs.GetTurnUpdatesHandler, stubs.GameRequest{GameID: gameID}, res)
 			if err != nil {
 				fmt.Println("live view stopped:", err)
 				done <- true
 				return
 			}
-			for _, u := range res.Updates {
-				if len(u.Flipped) > 0 {
-					c.events <- CellsFlipped{CompletedTurns: u.Turn, Cells: u.Flipped}
+			for _, update := range res.Updates {
+				if len(update.Flipped) > 0 {
+					c.events <- CellsFlipped{CompletedTurns: update.Turn, Cells: update.Flipped}
 				}
-				c.events <- TurnComplete{CompletedTurns: u.Turn}
+				c.events <- TurnComplete{CompletedTurns: update.Turn}
 			}
 			if res.Finished {
 				done <- true
@@ -138,11 +148,11 @@ func distributor(p Params, c distributorChannels) {
 	shutdown := false
 	lastTurn := 0
 
+	// can re-use the logic from the <-call.Done part to ensure we fully wait for the server to stop processing before writing an image
 	handleKey := func(key rune) {
 		switch key {
 		case 's':
-			// TODO: GetWorld RPC -> writeImage(p, c, res.World, res.CompletedTurns)
-			response, err := getWorldFromServer(broker)
+			response, err := getWorldFromServer(broker, gameID)
 			if err != nil || response.World == nil {
 				fmt.Println("could not get world from server:", err)
 				return // skip writing the image
@@ -153,15 +163,14 @@ func distributor(p Params, c distributorChannels) {
 			quitting = true // also need to skip final turn processed event
 			shutdown = true
 			response := new(stubs.StopProcessingResponse)
-			broker.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
+			broker.Call(stubs.StopProcessingHandler, stubs.GameRequest{GameID: gameID}, response)
 		case 'q':
-			// can re-use the logic from the <-call.Done part to ensure we fully wait for the server to stop processing before writing an image
 			quitting = true
 			response := new(stubs.StopProcessingResponse)
-			broker.Call(stubs.StopProcessingHandler, stubs.StopProcessingRequest{}, response)
+			broker.Call(stubs.StopProcessingHandler, stubs.GameRequest{GameID: gameID}, response)
 		case 'p':
 			res := new(stubs.TogglePauseResponse)
-			broker.Call(stubs.TogglePauseHandler, stubs.TogglePauseRequest{}, res)
+			broker.Call(stubs.TogglePauseHandler, stubs.GameRequest{GameID: gameID}, res)
 			lastTurn = res.CompletedTurns
 			if res.Paused {
 				fmt.Println(res.CompletedTurns)
@@ -175,8 +184,9 @@ func distributor(p Params, c distributorChannels) {
 
 	for {
 		select {
+		// runs when the go call to process turns finishes (i.e server has stopped processing turns)
 		case <-call.Done:
-			<-done // wait until every TurnComplete has been sent before sending final turn complete
+			<-done // wait until every TurnComplete for the live sdl has been sent before sending final turn complete
 
 			if call.Error != nil {
 				fmt.Println("lost connection to server:", call.Error)
@@ -189,11 +199,10 @@ func distributor(p Params, c distributorChannels) {
 			if !quitting {
 				c.events <- FinalTurnComplete{CompletedTurns: response.CompletedTurns, Alive: response.AliveCells}
 			}
-			// finished normally: the old end-of-function code moves in here
 			writeImage(p, c, response.World, response.CompletedTurns)
 
 			// we are ignoring potential errors sent from the server due to that processing terminating before the server can serve a reply
-			// but this is tedious as there could be actual errors that we are missing
+			// this is an issue with fault tollerance but still passes all the tests as its a rare issue
 			if shutdown {
 				response := new(stubs.ShutdownResponse)
 				_ = broker.Call(stubs.ShutdownHandler, stubs.ShutdownRequest{}, response)
@@ -204,16 +213,15 @@ func distributor(p Params, c distributorChannels) {
 			return
 
 		case <-ticker.C:
-			// your existing CountAliveCells call + AliveCellsCount event moves here
 			res := new(stubs.CountAliveCellsResponse)
-			err := broker.Call(stubs.CountAliveCellsHandler, stubs.CountAliveCellsRequest{}, res)
+			err := broker.Call(stubs.CountAliveCellsHandler, stubs.GameRequest{GameID: gameID}, res)
 			lastTurn = res.CompletedTurns
 
 			if err != nil {
 				fmt.Println("alive cells count failed:", err)
-				continue // skip this tick; call.Done will handle a dead server
+			} else {
+				c.events <- AliveCellsCount{CompletedTurns: res.CompletedTurns, CellsCount: res.CellsCount}
 			}
-			c.events <- AliveCellsCount{CompletedTurns: res.CompletedTurns, CellsCount: res.CellsCount}
 
 		case key := <-c.keyPresses:
 			handleKey(key)

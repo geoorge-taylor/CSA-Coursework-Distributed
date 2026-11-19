@@ -2,10 +2,12 @@ package stubs
 
 import "uk.ac.bris.cs/gameoflife/util"
 
-// ---- Controller <-> broker ----
+// Controller to broker
 
 const (
+	StartGameHandler       = "Broker.StartGame"
 	ProcessTurnsHandler    = "Broker.ProcessTurns"
+	GetTurnUpdatesHandler  = "Broker.GetTurnUpdates"
 	CountAliveCellsHandler = "Broker.CountAliveCells"
 	GetWorldHandler        = "Broker.GetWorld"
 	TogglePauseHandler     = "Broker.TogglePause"
@@ -13,13 +15,28 @@ const (
 	ShutdownHandler        = "Broker.Shutdown"
 )
 
-type ProcessTurnsRequest struct {
+// the request for every call that only needs to say which game it is for:
+// GetTurnUpdates, CountAliveCells, GetWorld, TogglePause and StopProcessing
+type GameRequest struct {
+	GameID int64
+}
+
+// StartGame
+type StartGameRequest struct {
 	World       [][]byte
 	ImageWidth  int
 	ImageHeight int
-	Turns       int
 	Threads     int
-	RunID       int64 // identifies this controller's game, so stale pollers can be told apart
+}
+
+type StartGameResponse struct {
+	GameID int64
+}
+
+// ProcessTurns
+type ProcessTurnsRequest struct {
+	GameID int64
+	Turns  int
 }
 
 type ProcessTurnsResponse struct {
@@ -28,81 +45,67 @@ type ProcessTurnsResponse struct {
 	AliveCells     []util.Cell
 }
 
-type CountAliveCellsRequest struct{}
+// GetTurnUpdates (live view)
+type TurnUpdate struct {
+	Turn    int
+	Flipped []util.Cell
+}
 
+type GetTurnUpdatesResponse struct {
+	Updates  []TurnUpdate
+	Finished bool // no more turns coming
+}
+
+// CountAliveCells
 type CountAliveCellsResponse struct {
 	CellsCount     int
 	CompletedTurns int
 }
 
-type GetWorldRequest struct{}
-
+// GetWorld
 type GetWorldResponse struct {
 	World          [][]byte
 	CompletedTurns int
 }
 
-type TogglePauseRequest struct{}
-
+// TogglePause
 type TogglePauseResponse struct {
 	Paused         bool
 	CompletedTurns int
 }
 
-type StopProcessingRequest struct{}
+// StopProcessing
 type StopProcessingResponse struct{}
 
-// Also used by the broker when it shuts down a worker node.
+// Shutdown (also used by the broker to shut down each worker node)
 type ShutdownRequest struct{}
 type ShutdownResponse struct{}
 
-// ---- Broker <-> worker node ----
+// Broker to worker nodes
 
 const (
-	// Called by a worker node on the broker to register itself.
-	SubscribeHandler = "Broker.Subscribe"
-
-	// The callback the broker invokes on a worker node for each strip.
+	SubscribeHandler      = "Broker.Subscribe"
 	CalculateStripHandler = "Worker.CalculateStrip"
-
-	// Called by the broker on a worker node to make it exit.
 	WorkerShutdownHandler = "Worker.Shutdown"
 )
 
-// Sent by a worker node to the broker when it starts up.
+// Subscribe (worker to broker)
 type Subscription struct {
-	WorkerAddress string // address the broker should dial back, e.g. "172.31.0.5:8040"
+	WorkerAddress string
 }
 
 type StatusReport struct {
 	Message string
 }
 
-// One strip of work. Rows holds the strip plus one extra row above and one below
-// (already wrapped by the broker), so len(Rows) is the strip height + 2.
+// CalculateStrip (broker to worker)
 type StripJob struct {
 	Rows    [][]byte
 	StartY  int
 	Threads int
 }
 
-// The next state of a strip, without the two extra rows.
 type StripResult struct {
 	Rows    [][]byte
 	Flipped []util.Cell
-}
-
-// stubs.go
-const GetTurnUpdatesHandler = "Broker.GetTurnUpdates"
-
-type TurnUpdate struct {
-	Turn    int
-	Flipped []util.Cell
-}
-type GetTurnUpdatesRequest struct {
-	RunID int64 // must match the RunID sent in ProcessTurnsRequest
-}
-type GetTurnUpdatesResponse struct {
-	Updates  []TurnUpdate
-	Finished bool // no more turns coming
 }

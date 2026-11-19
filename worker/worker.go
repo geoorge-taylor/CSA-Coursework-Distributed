@@ -11,8 +11,6 @@ import (
 	"uk.ac.bris.cs/gameoflife/util"
 )
 
-// ---- Types and constants ----
-
 const (
 	alive byte = 255
 	dead  byte = 0
@@ -24,8 +22,6 @@ type Worker struct {
 	pool     *workerPool
 }
 
-// worker computes one horizontal piece of this node's strip each turn.
-// startY and endY index into job.Rows, which includes the two halo rows.
 type worker struct {
 	startY int
 	endY   int
@@ -38,7 +34,7 @@ type workerPool struct {
 	threads     int
 	stripHeight int
 	workers     []worker
-	done        chan bool // each worker sends on this when it exits
+	done        chan bool
 }
 
 // stripResult is the next state of one piece and the cells that changed in it.
@@ -46,8 +42,6 @@ type stripResult struct {
 	rows    [][]byte
 	flipped []util.Cell
 }
-
-// ---- Helpers ----
 
 func countLiveNeighbours(world [][]byte, width, height, row, column int) int {
 	count := 0
@@ -148,7 +142,7 @@ func nextTurn(pool *workerPool, job stubs.StripJob) ([][]byte, []util.Cell) {
 	newStrip := make([][]byte, 0, pool.stripHeight)
 	flipped := []util.Cell{}
 
-	// append back in order
+	// append back in order via waiting on result channel in each worker
 	for _, w := range pool.workers {
 		piece := <-w.result
 		newStrip = append(newStrip, piece.rows...)
@@ -167,7 +161,7 @@ func stopPool(pool *workerPool) {
 	}
 }
 
-// ---- RPC methods called by the broker ----
+// RPC methods called by the server
 
 func (w *Worker) CalculateStrip(job stubs.StripJob, res *stubs.StripResult) (err error) {
 	w.mu.Lock()
@@ -183,6 +177,7 @@ func (w *Worker) CalculateStrip(job stubs.StripJob, res *stubs.StripResult) (err
 	}
 
 	// the pool is reused every turn, and only rebuilt when a new run changes its shape i.e number of threads
+	// also if the image size changes then the worker pool also needs to be changed
 	if w.pool == nil || w.pool.threads != threads || w.pool.stripHeight != stripHeight {
 		if w.pool != nil {
 			// if a pool exists we need to change it so stop it
@@ -207,14 +202,11 @@ func (w *Worker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse
 	return
 }
 
-// ---- Entry point ----
-
 func main() {
 	pAddr := flag.String("ip", "127.0.0.1:8040", "IP and port to listen on")
 	brokerAddr := flag.String("broker", "127.0.0.1:8030", "Address of broker instance")
 	flag.Parse()
 
-	// 1. Connect to the broker first
 	client, err := rpc.Dial("tcp", *brokerAddr)
 	if err != nil {
 		fmt.Println("Could not reach broker:", err)
@@ -222,11 +214,9 @@ func main() {
 	}
 	defer client.Close()
 
-	// 2. Create the worker and register it
 	worker := &Worker{shutdown: make(chan bool, 1)}
 	rpc.Register(worker)
 
-	// 3. Start listening, so the broker can connect back
 	listener, err := net.Listen("tcp", *pAddr)
 	if err != nil {
 		fmt.Println("Could not listen on own port:", err)
@@ -235,7 +225,6 @@ func main() {
 	defer listener.Close()
 	myAddr := listener.Addr().String()
 
-	// 4. Subscribe to the broker
 	subscription := stubs.Subscription{
 		WorkerAddress: myAddr,
 	}
@@ -247,10 +236,8 @@ func main() {
 		return
 	}
 
-	// 5. Handle incoming jobs in the background
 	fmt.Println("Listening for jobs from broker")
 	go rpc.Accept(listener)
 
-	// 6. Wait until the broker tells this worker to shut down
 	<-worker.shutdown
 }
