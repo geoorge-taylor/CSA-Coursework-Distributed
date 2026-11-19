@@ -14,28 +14,18 @@ import (
 
 const alive byte = 255
 
-var errNotCurrentGame = errors.New("this game has been replaced by a newer one")
-
 type Broker struct {
 	mu           sync.Mutex
 	cond         *sync.Cond
+	world        [][]byte
+	turn         int
+	height       int
+	quit         bool
+	paused       bool
 	shutdown     chan bool
 	shuttingDown bool
 	workers      []worker
-	nextID       int64 // next id of the next game
-	current      *game
-}
-
-type game struct {
-	id      int64
-	world   [][]byte
-	turn    int
-	paused  bool
-	quit    bool
-	running bool
-	done    bool
-	pending []stubs.TurnUpdate
-	threads int
+	threads      int // threads per worker node, sent by the controller
 }
 
 type worker struct {
@@ -58,16 +48,8 @@ func aliveCells(world [][]byte) []util.Cell {
 	return cells
 }
 
-// Internal methods not used via RPC
+// Internal methods
 
-func (b *Broker) gameFor(id int64) *game {
-	if b.current != nil && b.current.id == id {
-		return b.current
-	}
-	return nil
-}
-
-// conect back to a given worker via rpc so the broker can eventually communicate with ti
 func (b *Broker) addWorker(workerAddress string) (err error) {
 	workerNode, err := rpc.Dial("tcp", workerAddress)
 	if err != nil {
@@ -80,35 +62,31 @@ func (b *Broker) addWorker(workerAddress string) (err error) {
 	return
 }
 
-// works out what part of the image each worker should be working on (incl halo rows)
-func assignStrips(workers []worker, height int) {
-	n := len(workers)
-	for i := range workers {
-		startY := i * height / n
-		endY := (i + 1) * height / n
+func (b *Broker) assignStrips() {
+	n := len(b.workers)
+	for i := range b.workers {
+		startY := i * b.height / n
+		endY := (i + 1) * b.height / n
 
-		workers[i].startY = startY
-		workers[i].endY = endY
-		workers[i].haloAbove = (startY - 1 + height) % height // wraps to the last row
-		workers[i].haloBelow = endY % height                  // wraps to row 0
+		b.workers[i].startY = startY
+		b.workers[i].endY = endY
+		b.workers[i].haloAbove = (startY - 1 + b.height) % b.height // wraps to the last row
+		b.workers[i].haloBelow = endY % b.height                    // wraps to row 0
 	}
 }
 
-// computes the next turn of the world given every worker and how many threads should be used for each worker
-// uses the same logic as the paralell implementation, but just over RPC instead, which is why we use rpc call slice and block on <-call.Done
-func nextTurn(workers []worker, world [][]byte, threads int) ([][]byte, []util.Cell) {
+func (b *Broker) nextTurn(world [][]byte) [][]byte {
 	height := len(world)
 
 	// send every worker node its strip, with a halo row above and below
-	calls := make([]*rpc.Call, len(workers))
-
-	for i, w := range workers {
+	calls := make([]*rpc.Call, len(b.workers))
+	for i, w := range b.workers {
 		rows := make([][]byte, 0, w.endY-w.startY+2) // +2 for the halo rows
 		rows = append(rows, world[w.haloAbove])
 		rows = append(rows, world[w.startY:w.endY]...)
 		rows = append(rows, world[w.haloBelow])
 
-		job := stubs.StripJob{Rows: rows, StartY: w.startY, Threads: threads}
+		job := stubs.StripJob{Rows: rows, Threads: b.threads}
 		calls[i] = w.workerNode.Go(
 			stubs.CalculateStripHandler,
 			job,
@@ -117,25 +95,21 @@ func nextTurn(workers []worker, world [][]byte, threads int) ([][]byte, []util.C
 		)
 	}
 
-	// collect the strips in worker order
+	// collect the strips in worker order, same as the parallel version
 	newWorld := make([][]byte, 0, height)
-	flippedCells := []util.Cell{}
-
 	for _, call := range calls {
 		<-call.Done
 		if call.Error != nil {
 			fmt.Println("worker node failed:", call.Error)
 		}
-		stripResult := call.Reply.(*stubs.StripResult)
-		newWorld = append(newWorld, stripResult.Rows...)
-		flippedCells = append(flippedCells, stripResult.Flipped...)
+		strip := call.Reply.(*stubs.StripResult)
+		newWorld = append(newWorld, strip.Rows...)
 	}
-	return newWorld, flippedCells
+	return newWorld
 }
 
-// RPC methods called by the worker nodes
+// RPC methods called by worker nodes
 
-// allows a worker to connect to the server (broker), and add the worker to known workers too
 func (b *Broker) Subscribe(req stubs.Subscription, res *stubs.StatusReport) (err error) {
 	err = b.addWorker(req.WorkerAddress)
 	if err != nil {
@@ -146,86 +120,44 @@ func (b *Broker) Subscribe(req stubs.Subscription, res *stubs.StatusReport) (err
 
 // RPC methods called by the local controller
 
-func (b *Broker) StartGame(req stubs.StartGameRequest, res *stubs.StartGameResponse) (err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// if an old game still exists, make it quit and wake up the loops in it so it realises it has quit
-	// also wait untill the old game has stopped running (finished)
-	old := b.current
-	if old != nil {
-		old.quit = true
-		b.cond.Broadcast()
-		for old.running {
-			b.cond.Wait()
-		}
-	}
-
-	if len(b.workers) == 0 {
-		return errors.New("no worker nodes have subscribed")
-	}
-
-	// figure out how to assign the strips to all the workers, different start game requests may have different image sizes
-	assignStrips(b.workers, req.ImageHeight)
-	b.nextID++
-	b.current = &game{id: b.nextID, world: req.World, threads: req.Threads}
-	b.cond.Broadcast() // wakes an old poller still waiting on the replaced game so it sees its game is gone
-	res.GameID = b.nextID
-	return
-}
-
-// called from controller to start running all the turns of a given game id
+// Receive the world from the local controller, evolve it for the requested number of turns and send back the result
 func (b *Broker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessTurnsResponse) (err error) {
 	b.mu.Lock()
-	// if this is being called for the wrong game, or the current game is either running or done, return an error
-	// stops process turns from being called multiple times and for the wrong game
-	g := b.gameFor(req.GameID)
-	if g == nil || g.running || g.done {
+	b.world = req.World
+	b.height = req.ImageHeight
+	b.threads = req.Threads
+	if len(b.workers) == 0 {
 		b.mu.Unlock()
-		return errNotCurrentGame
+		return errors.New("no worker nodes have subscribed")
 	}
-
-	// set running to true as soon as we know we can start processing turns
-	g.running = true
+	b.assignStrips()
 	b.mu.Unlock()
 
 	for t := 0; t < req.Turns; t++ {
 		b.mu.Lock()
-		for g.paused && !g.quit {
+		for b.paused && !b.quit {
 			// sleep this go routine but keep mutex unlocked
 			b.cond.Wait()
 		}
-		if g.quit {
+		if b.quit {
 			b.mu.Unlock()
 			break
 		}
-		world := g.world
 		b.mu.Unlock()
 
-		// calculate next turn using the brokers registered workers, and the number of threads for the specific game
-		newWorld, flippedCells := nextTurn(b.workers, world, g.threads)
+		newWorld := b.nextTurn(b.world)
 		b.mu.Lock()
-		g.world = newWorld
-		g.turn++
-
-		// add the flipped cells and the corresponding turn to the pending slice
-		g.pending = append(g.pending, stubs.TurnUpdate{
-			Turn:    g.turn,
-			Flipped: flippedCells,
-		})
-
-		// alert the get turn update that pending cells are ready to be sent to controller
-		b.cond.Broadcast()
+		b.world = newWorld
+		b.turn++
 		b.mu.Unlock()
 	}
 
-	// read results from the game and set the games flags to signal that it has finished processing all turns
 	b.mu.Lock()
-	finalWorld := g.world
-	finalTurn := g.turn
-	g.running = false
-	g.done = true
-	b.cond.Broadcast()
+	finalWorld := b.world
+	finalTurn := b.turn
+	b.quit = false
+	b.paused = false
+	b.turn = 0
 	b.mu.Unlock()
 
 	res.World = finalWorld
@@ -235,17 +167,10 @@ func (b *Broker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessT
 	return
 }
 
-func (b *Broker) CountAliveCells(req stubs.GameRequest, res *stubs.CountAliveCellsResponse) (err error) {
+func (b *Broker) CountAliveCells(req stubs.CountAliveCellsRequest, res *stubs.CountAliveCellsResponse) (err error) {
 	b.mu.Lock()
-
-	// if this request was for an old game, just simply ignore it and return an error
-	g := b.gameFor(req.GameID)
-	if g == nil {
-		b.mu.Unlock()
-		return errNotCurrentGame
-	}
-	currentWorld := g.world
-	completedTurns := g.turn
+	currentWorld := b.world
+	completedTurns := b.turn
 	b.mu.Unlock()
 
 	res.CellsCount = len(aliveCells(currentWorld))
@@ -253,41 +178,28 @@ func (b *Broker) CountAliveCells(req stubs.GameRequest, res *stubs.CountAliveCel
 	return
 }
 
-func (b *Broker) GetWorld(req stubs.GameRequest, res *stubs.GetWorldResponse) (err error) {
+func (b *Broker) GetWorld(req stubs.GetWorldRequest, res *stubs.GetWorldResponse) (err error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	g := b.gameFor(req.GameID)
-	if g == nil {
-		return errNotCurrentGame
-	}
-	res.World = g.world
-	res.CompletedTurns = g.turn
+	res.World = b.world
+	res.CompletedTurns = b.turn
+	b.mu.Unlock()
 	return
 }
 
-func (b *Broker) TogglePause(req stubs.GameRequest, res *stubs.TogglePauseResponse) (err error) {
+func (b *Broker) TogglePause(req stubs.TogglePauseRequest, res *stubs.TogglePauseResponse) (err error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	g := b.gameFor(req.GameID)
-	if g == nil {
-		return errNotCurrentGame
-	}
-	g.paused = !g.paused
-	res.Paused = g.paused
-	res.CompletedTurns = g.turn
+	b.paused = !b.paused
+	res.Paused = b.paused
+	res.CompletedTurns = b.turn
 	b.cond.Broadcast()
+	b.mu.Unlock()
 	return
 }
 
-func (b *Broker) StopProcessing(req stubs.GameRequest, res *stubs.StopProcessingResponse) (err error) {
+func (b *Broker) StopProcessing(req stubs.StopProcessingRequest, res *stubs.StopProcessingResponse) (err error) {
 	b.mu.Lock()
-	g := b.gameFor(req.GameID)
-	if g != nil {
-		g.quit = true
-		b.cond.Broadcast()
-	}
+	b.quit = true
+	b.cond.Broadcast() // wake up paused loop to check if its paused again
 	b.mu.Unlock()
 	return
 }
@@ -299,53 +211,26 @@ func (b *Broker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse
 		b.mu.Unlock()
 		return
 	}
-
 	b.shuttingDown = true
 	workers := b.workers
 	b.mu.Unlock()
 
-	// cleanly stop all workers and close the rpc connection to them
 	for _, w := range workers {
-		// the worker may exit before its reply arrives, so the error is ignored
 		w.workerNode.Call(stubs.WorkerShutdownHandler, stubs.ShutdownRequest{}, new(stubs.ShutdownResponse))
 		w.workerNode.Close()
 	}
 
-	// this allows the main function to get past the blocking call on this channel
 	b.shutdown <- true
 	return
-}
-
-func (b *Broker) GetTurnUpdates(req stubs.GameRequest, res *stubs.GetTurnUpdatesResponse) (err error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	for {
-		// alert controller that a new game has started so the current one they are requesting has finished
-		g := b.gameFor(req.GameID)
-		if g == nil {
-			res.Finished = true
-			return
-		}
-
-		// alert controller that updates are ready to be displayed and clear out the pending updates
-		if len(g.pending) > 0 || g.done {
-			res.Updates = g.pending
-			res.Finished = g.done
-			g.pending = nil
-			return
-		}
-
-		// if nothing can happen just wait untill processTurns alerts this loop to wake up as more updates are pending
-		b.cond.Wait()
-	}
 }
 
 func main() {
 	pAddr := flag.String("port", ":8030", "Port to listen on")
 	flag.Parse()
 
-	broker := &Broker{shutdown: make(chan bool, 1)}
+	broker := &Broker{
+		shutdown: make(chan bool, 1),
+	}
 	broker.cond = sync.NewCond(&broker.mu)
 	rpc.Register(broker)
 

@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"uk.ac.bris.cs/gameoflife/stubs"
-	"uk.ac.bris.cs/gameoflife/util"
 )
 
 const (
@@ -22,25 +21,20 @@ type Worker struct {
 	pool     *workerPool
 }
 
+// one goroutine inside this worker node, responsible for a fixed piece of the strip
 type worker struct {
 	startY int
 	endY   int
 	work   chan stubs.StripJob // receives the current strip (with halo rows)
-	result chan stripResult    // sends back the next state of this piece
+	result chan [][]byte
 }
 
-// workerPool is a fixed set of workers reused for every turn.
+// workerPool is a fixed set of goroutines reused for every turn.
 type workerPool struct {
 	threads     int
 	stripHeight int
 	workers     []worker
 	done        chan bool
-}
-
-// stripResult is the next state of one piece and the cells that changed in it.
-type stripResult struct {
-	rows    [][]byte
-	flipped []util.Cell
 }
 
 func countLiveNeighbours(world [][]byte, width, height, row, column int) int {
@@ -72,8 +66,9 @@ func countLiveNeighbours(world [][]byte, width, height, row, column int) int {
 	return count
 }
 
-// rows includes a halo row above and below, so startY >= 1 and endY <= len(rows)-1
-func calculateStrip(rows [][]byte, startY, endY, offsetY int) stripResult {
+// calculateStrip returns the next state of rows[startY:endY].
+// rows includes a halo row above and below, so startY >= 1 and endY <= len(rows)-1.
+func calculateStrip(rows [][]byte, startY, endY int) [][]byte {
 	height := len(rows)
 	width := len(rows[0])
 
@@ -83,30 +78,24 @@ func calculateStrip(rows [][]byte, startY, endY, offsetY int) stripResult {
 		copy(newStrip[y], rows[startY+y])
 	}
 
-	flipped := []util.Cell{}
 	for y := startY; y < endY; y++ {
 		for x := 0; x < width; x++ {
 			liveNeighbours := countLiveNeighbours(rows, width, height, y, x)
 			if rows[y][x] == alive && (liveNeighbours < 2 || liveNeighbours > 3) {
 				// y-startY sets index back to start at 0
 				newStrip[y-startY][x] = dead
-				flipped = append(flipped, util.Cell{X: x, Y: offsetY + (y - 1)})
 			} else if rows[y][x] == dead && liveNeighbours == 3 {
 				newStrip[y-startY][x] = alive
-				flipped = append(flipped, util.Cell{X: x, Y: offsetY + (y - 1)})
 			}
 		}
 	}
-	return stripResult{
-		rows:    newStrip,
-		flipped: flipped,
-	}
+	return newStrip
 }
 
 func runWorker(w worker, done chan<- bool) {
 	// range blocks until work arrives, and the loop ends when the channel is closed
 	for job := range w.work {
-		w.result <- calculateStrip(job.Rows, w.startY, w.endY, job.StartY)
+		w.result <- calculateStrip(job.Rows, w.startY, w.endY)
 	}
 	done <- true
 }
@@ -125,7 +114,7 @@ func newWorkerPool(threads, stripHeight int) *workerPool {
 			startY: 1 + i*stripHeight/threads,
 			endY:   1 + (i+1)*stripHeight/threads,
 			work:   make(chan stubs.StripJob),
-			result: make(chan stripResult),
+			result: make(chan [][]byte),
 		}
 		pool.workers[i] = w
 		go runWorker(w, pool.done)
@@ -134,22 +123,17 @@ func newWorkerPool(threads, stripHeight int) *workerPool {
 	return pool
 }
 
-func nextTurn(pool *workerPool, job stubs.StripJob) ([][]byte, []util.Cell) {
+func nextTurn(pool *workerPool, job stubs.StripJob) [][]byte {
 	for _, w := range pool.workers {
 		w.work <- job
 	}
 
-	newStrip := make([][]byte, 0, pool.stripHeight)
-	flipped := []util.Cell{}
-
 	// append back in order via waiting on result channel in each worker
+	newStrip := make([][]byte, 0, pool.stripHeight)
 	for _, w := range pool.workers {
-		piece := <-w.result
-		newStrip = append(newStrip, piece.rows...)
-		flipped = append(flipped, piece.flipped...)
+		newStrip = append(newStrip, <-w.result...)
 	}
-
-	return newStrip, flipped
+	return newStrip
 }
 
 func stopPool(pool *workerPool) {
@@ -161,8 +145,9 @@ func stopPool(pool *workerPool) {
 	}
 }
 
-// RPC methods called by the server
+// RPC methods called by the broker
 
+// calculateStrip is the callback the broker invokes for each strip.
 func (w *Worker) CalculateStrip(job stubs.StripJob, res *stubs.StripResult) (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -186,11 +171,12 @@ func (w *Worker) CalculateStrip(job stubs.StripJob, res *stubs.StripResult) (err
 		w.pool = newWorkerPool(threads, stripHeight)
 	}
 
-	res.Rows, res.Flipped = nextTurn(w.pool, job)
+	res.Rows = nextTurn(w.pool, job)
 	return
 }
 
-// use a lock so that we cant shutdown while strips are being calculated
+// Shutdown is called by the broker when the controller presses k.
+// stops the pool's goroutines, then wakes main, which returns and ends the program.
 func (w *Worker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse) (err error) {
 	w.mu.Lock()
 	if w.pool != nil {
