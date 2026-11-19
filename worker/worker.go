@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"net"
 	"net/rpc"
+	"sync"
 
 	"uk.ac.bris.cs/gameoflife/stubs"
+	"uk.ac.bris.cs/gameoflife/util"
 )
 
 // ---- Types and constants ----
@@ -18,6 +20,31 @@ const (
 
 type Worker struct {
 	shutdown chan bool
+	mu       sync.Mutex
+	pool     *workerPool
+}
+
+// worker computes one horizontal piece of this node's strip each turn.
+// startY and endY index into job.Rows, which includes the two halo rows.
+type worker struct {
+	startY int
+	endY   int
+	work   chan stubs.StripJob // receives the current strip (with halo rows)
+	result chan stripResult    // sends back the next state of this piece
+}
+
+// workerPool is a fixed set of workers reused for every turn.
+type workerPool struct {
+	threads     int
+	stripHeight int
+	workers     []worker
+	done        chan bool // each worker sends on this when it exits
+}
+
+// stripResult is the next state of one piece and the cells that changed in it.
+type stripResult struct {
+	rows    [][]byte
+	flipped []util.Cell
 }
 
 // ---- Helpers ----
@@ -51,45 +78,131 @@ func countLiveNeighbours(world [][]byte, width, height, row, column int) int {
 	return count
 }
 
-// calculateStrip returns the next state of the strip inside rows.
-// The first and last rows are halo rows: they are read as neighbours but not
-// calculated, which is why the loops start at 1 and end at height-1.
-func calculateStrip(rows [][]byte) [][]byte {
+// rows includes a halo row above and below, so startY >= 1 and endY <= len(rows)-1
+func calculateStrip(rows [][]byte, startY, endY, offsetY int) stripResult {
 	height := len(rows)
 	width := len(rows[0])
 
-	newStrip := make([][]byte, height-2)
-	for y := 1; y < height-1; y++ {
-		newStrip[y-1] = make([]byte, width)
-		copy(newStrip[y-1], rows[y])
+	newStrip := make([][]byte, endY-startY)
+	for y := range newStrip {
+		newStrip[y] = make([]byte, width)
+		copy(newStrip[y], rows[startY+y])
 	}
 
-	for y := 1; y < height-1; y++ {
+	flipped := []util.Cell{}
+	for y := startY; y < endY; y++ {
 		for x := 0; x < width; x++ {
 			liveNeighbours := countLiveNeighbours(rows, width, height, y, x)
 			if rows[y][x] == alive && (liveNeighbours < 2 || liveNeighbours > 3) {
-				// y-1 sets index back to start at 0, since the first row was ignored
-				newStrip[y-1][x] = dead
+				// y-startY sets index back to start at 0
+				newStrip[y-startY][x] = dead
+				flipped = append(flipped, util.Cell{X: x, Y: offsetY + (y - 1)})
 			} else if rows[y][x] == dead && liveNeighbours == 3 {
-				newStrip[y-1][x] = alive
+				newStrip[y-startY][x] = alive
+				flipped = append(flipped, util.Cell{X: x, Y: offsetY + (y - 1)})
 			}
 		}
 	}
-	return newStrip
+	return stripResult{
+		rows:    newStrip,
+		flipped: flipped,
+	}
+}
+
+func runWorker(w worker, done chan<- bool) {
+	// range blocks until work arrives, and the loop ends when the channel is closed
+	for job := range w.work {
+		w.result <- calculateStrip(job.Rows, w.startY, w.endY, job.StartY)
+	}
+	done <- true
+}
+
+func newWorkerPool(threads, stripHeight int) *workerPool {
+	pool := &workerPool{
+		threads:     threads,
+		stripHeight: stripHeight,
+		workers:     make([]worker, threads),
+		done:        make(chan bool),
+	}
+
+	for i := 0; i < threads; i++ {
+		w := worker{
+			// +1 skips the halo row at the top of job.Rows
+			startY: 1 + i*stripHeight/threads,
+			endY:   1 + (i+1)*stripHeight/threads,
+			work:   make(chan stubs.StripJob),
+			result: make(chan stripResult),
+		}
+		pool.workers[i] = w
+		go runWorker(w, pool.done)
+	}
+
+	return pool
+}
+
+func nextTurn(pool *workerPool, job stubs.StripJob) ([][]byte, []util.Cell) {
+	for _, w := range pool.workers {
+		w.work <- job
+	}
+
+	newStrip := make([][]byte, 0, pool.stripHeight)
+	flipped := []util.Cell{}
+
+	// append back in order
+	for _, w := range pool.workers {
+		piece := <-w.result
+		newStrip = append(newStrip, piece.rows...)
+		flipped = append(flipped, piece.flipped...)
+	}
+
+	return newStrip, flipped
+}
+
+func stopPool(pool *workerPool) {
+	for _, w := range pool.workers {
+		close(w.work)
+	}
+	for range pool.workers {
+		<-pool.done
+	}
 }
 
 // ---- RPC methods called by the broker ----
 
-// CalculateStrip is the callback the broker invokes for each strip.
-// job.Rows is the strip plus the extra halo rows so the whole strip can be calculated
 func (w *Worker) CalculateStrip(job stubs.StripJob, res *stubs.StripResult) (err error) {
-	res.Rows = calculateStrip(job.Rows)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	stripHeight := len(job.Rows) - 2
+	threads := job.Threads
+	if threads > stripHeight {
+		threads = stripHeight
+	}
+	if threads < 1 {
+		threads = 1
+	}
+
+	// the pool is reused every turn, and only rebuilt when a new run changes its shape i.e number of threads
+	if w.pool == nil || w.pool.threads != threads || w.pool.stripHeight != stripHeight {
+		if w.pool != nil {
+			// if a pool exists we need to change it so stop it
+			stopPool(w.pool)
+		}
+		w.pool = newWorkerPool(threads, stripHeight)
+	}
+
+	res.Rows, res.Flipped = nextTurn(w.pool, job)
 	return
 }
 
-// Shutdown is called by the broker when the controller presses k.
-// It wakes main, which then returns and ends the program.
+// use a lock so that we cant shutdown while strips are being calculated
 func (w *Worker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse) (err error) {
+	w.mu.Lock()
+	if w.pool != nil {
+		stopPool(w.pool)
+		w.pool = nil
+	}
+	w.mu.Unlock()
 	w.shutdown <- true
 	return
 }

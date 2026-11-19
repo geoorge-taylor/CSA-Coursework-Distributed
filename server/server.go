@@ -27,6 +27,10 @@ type Broker struct {
 	shutdown     chan bool
 	shuttingDown bool
 	workers      []worker
+	pending      []stubs.TurnUpdate
+	threads      int
+	running      bool  // a game is currently being processed
+	runID        int64 // RunID of the current game
 }
 
 type worker struct {
@@ -78,18 +82,19 @@ func (b *Broker) assignStrips() {
 	}
 }
 
-func (b *Broker) nextTurn(world [][]byte) [][]byte {
+func (b *Broker) nextTurn(world [][]byte) ([][]byte, []util.Cell) {
 	height := len(world)
 
 	// send every worker node its strip, with a halo row above and below
 	calls := make([]*rpc.Call, len(b.workers))
+
 	for i, w := range b.workers {
 		rows := make([][]byte, 0, w.endY-w.startY+2) // +2 for the halo rows
 		rows = append(rows, world[w.haloAbove])
 		rows = append(rows, world[w.startY:w.endY]...)
 		rows = append(rows, world[w.haloBelow])
 
-		job := stubs.StripJob{Rows: rows}
+		job := stubs.StripJob{Rows: rows, StartY: w.startY, Threads: b.threads}
 		calls[i] = w.workerNode.Go(
 			stubs.CalculateStripHandler,
 			job,
@@ -100,15 +105,18 @@ func (b *Broker) nextTurn(world [][]byte) [][]byte {
 
 	// collect the strips in worker order, same as the parallel version
 	newWorld := make([][]byte, 0, height)
+	flippedCells := []util.Cell{}
+
 	for _, call := range calls {
 		<-call.Done
 		if call.Error != nil {
 			fmt.Println("worker node failed:", call.Error)
 		}
-		strip := call.Reply.(*stubs.StripResult)
-		newWorld = append(newWorld, strip.Rows...)
+		stripResult := call.Reply.(*stubs.StripResult)
+		newWorld = append(newWorld, stripResult.Rows...)
+		flippedCells = append(flippedCells, stripResult.Flipped...)
 	}
-	return newWorld
+	return newWorld, flippedCells
 }
 
 // ---- RPC methods called by worker nodes ----
@@ -126,12 +134,26 @@ func (b *Broker) Subscribe(req stubs.Subscription, res *stubs.StatusReport) (err
 // Receive the world from the local controller, evolve it for the requested number of turns and send back the result
 func (b *Broker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessTurnsResponse) (err error) {
 	b.mu.Lock()
-	b.world = req.World
-	b.height = req.ImageHeight
+	// a new controller takes over: stop any game still running and wait for it to end
+	if b.running {
+		b.quit = true
+		b.cond.Broadcast()
+		for b.running {
+			b.cond.Wait()
+		}
+	}
+	b.runID = req.RunID
+	b.pending = nil
 	if len(b.workers) == 0 {
+		b.cond.Broadcast() // running stays false, so this game's poller is told it has finished
 		b.mu.Unlock()
 		return errors.New("no worker nodes have subscribed")
 	}
+	b.running = true
+	b.quit = false
+	b.world = req.World
+	b.height = req.ImageHeight
+	b.threads = req.Threads
 	b.assignStrips()
 	b.mu.Unlock()
 
@@ -147,19 +169,25 @@ func (b *Broker) ProcessTurns(req stubs.ProcessTurnsRequest, res *stubs.ProcessT
 		}
 		b.mu.Unlock()
 
-		newWorld := b.nextTurn(b.world)
+		newWorld, flippedCells := b.nextTurn(b.world)
 		b.mu.Lock()
 		b.world = newWorld
 		b.turn++
+		b.pending = append(b.pending, stubs.TurnUpdate{
+			Turn:    b.turn,
+			Flipped: flippedCells,
+		})
+		b.cond.Broadcast()
 		b.mu.Unlock()
 	}
 
 	b.mu.Lock()
 	finalWorld := b.world
 	finalTurn := b.turn
-	b.quit = false
-	b.paused = false
+	b.running = false
+	b.paused = false // the next game starts unpaused unless a 'p' arrives before it starts
 	b.turn = 0
+	b.cond.Broadcast()
 	b.mu.Unlock()
 
 	res.World = finalWorld
@@ -227,6 +255,28 @@ func (b *Broker) Shutdown(req stubs.ShutdownRequest, res *stubs.ShutdownResponse
 	return
 }
 
+func (b *Broker) GetTurnUpdates(req stubs.GetTurnUpdatesRequest, res *stubs.GetTurnUpdatesResponse) (err error) {
+	b.mu.Lock()
+	for {
+		if req.RunID < b.runID {
+			// an older controller: its game has been replaced by a newer one
+			res.Finished = true
+			b.mu.Unlock()
+			return nil
+		}
+		// once this game is no longer running, it has finished
+		if req.RunID == b.runID && (len(b.pending) > 0 || !b.running) {
+			res.Updates = b.pending
+			res.Finished = !b.running
+			b.pending = nil
+			b.mu.Unlock()
+			return nil
+		}
+		// our game hasn't started yet, or there are no new turns
+		b.cond.Wait()
+	}
+}
+
 // ---- Entry point ----
 
 func main() {
@@ -234,9 +284,7 @@ func main() {
 	pAddr := flag.String("port", ":8030", "Port to listen on")
 	flag.Parse()
 
-	broker := &Broker{
-		shutdown: make(chan bool, 1),
-	}
+	broker := &Broker{shutdown: make(chan bool, 1)}
 	broker.cond = sync.NewCond(&broker.mu)
 	rpc.Register(broker)
 

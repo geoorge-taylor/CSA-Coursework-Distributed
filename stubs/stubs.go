@@ -18,6 +18,8 @@ type ProcessTurnsRequest struct {
 	ImageWidth  int
 	ImageHeight int
 	Turns       int
+	Threads     int
+	RunID       int64 // identifies this controller's game, so stale pollers can be told apart
 }
 
 type ProcessTurnsResponse struct {
@@ -79,10 +81,28 @@ type StatusReport struct {
 // One strip of work. Rows holds the strip plus one extra row above and one below
 // (already wrapped by the broker), so len(Rows) is the strip height + 2.
 type StripJob struct {
-	Rows [][]byte
+	Rows    [][]byte
+	StartY  int
+	Threads int
 }
 
 // The next state of a strip, without the two extra rows.
 type StripResult struct {
-	Rows [][]byte
+	Rows    [][]byte
+	Flipped []util.Cell
+}
+
+// stubs.go
+const GetTurnUpdatesHandler = "Broker.GetTurnUpdates"
+
+type TurnUpdate struct {
+	Turn    int
+	Flipped []util.Cell
+}
+type GetTurnUpdatesRequest struct {
+	RunID int64 // must match the RunID sent in ProcessTurnsRequest
+}
+type GetTurnUpdatesResponse struct {
+	Updates  []TurnUpdate
+	Finished bool // no more turns coming
 }

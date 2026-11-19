@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"uk.ac.bris.cs/gameoflife/stubs"
+	"uk.ac.bris.cs/gameoflife/util"
 )
 
 type distributorChannels struct {
@@ -22,7 +23,6 @@ type distributorChannels struct {
 var brokerAddr = flag.String("broker", "127.0.0.1:8030", "Address of broker instance")
 
 // distributor divides the work between workers and interacts with other goroutines.
-
 func loadWorld(p Params, c distributorChannels) [][]byte {
 	// Request initial image
 	c.ioCommand <- ioInput
@@ -37,6 +37,18 @@ func loadWorld(p Params, c distributorChannels) [][]byte {
 	}
 
 	return world
+}
+
+func getInitialFlippedCells(world [][]byte) []util.Cell {
+	initial := []util.Cell{}
+	for y, row := range world {
+		for x, cell := range row {
+			if cell == 255 {
+				initial = append(initial, util.Cell{X: x, Y: y})
+			}
+		}
+	}
+	return initial
 }
 
 func writeImage(p Params, c distributorChannels, world [][]byte, turn int) {
@@ -68,6 +80,9 @@ func getWorldFromServer(broker *rpc.Client) (*stubs.GetWorldResponse, error) {
 
 func distributor(p Params, c distributorChannels) {
 	world := loadWorld(p, c)
+	initial := getInitialFlippedCells(world)
+
+	c.events <- CellsFlipped{CompletedTurns: 0, Cells: initial}
 	c.events <- StateChange{CompletedTurns: 0, NewState: Executing}
 
 	// connect, need to change to the AWS port when set up
@@ -77,16 +92,44 @@ func distributor(p Params, c distributorChannels) {
 	}
 	defer broker.Close()
 
+	// unique id for this game, so the broker can tell this controller's requests apart from an older one's
+	runID := time.Now().UnixNano()
 	request := stubs.ProcessTurnsRequest{
+		RunID:       runID,
 		World:       world,
 		ImageWidth:  p.ImageWidth,
 		ImageHeight: p.ImageHeight,
 		Turns:       p.Turns,
+		Threads:     p.Threads,
 	}
 	response := new(stubs.ProcessTurnsResponse)
 
 	// use go so we can listen to keys meanwhile
 	call := broker.Go(stubs.ProcessTurnsHandler, request, response, nil)
+
+	// start listening to get turn update requests and push the events onto the channels
+	done := make(chan bool, 1)
+	go func() {
+		for {
+			res := new(stubs.GetTurnUpdatesResponse)
+			err := broker.Call(stubs.GetTurnUpdatesHandler, stubs.GetTurnUpdatesRequest{RunID: runID}, res)
+			if err != nil {
+				fmt.Println("live view stopped:", err)
+				done <- true
+				return
+			}
+			for _, u := range res.Updates {
+				if len(u.Flipped) > 0 {
+					c.events <- CellsFlipped{CompletedTurns: u.Turn, Cells: u.Flipped}
+				}
+				c.events <- TurnComplete{CompletedTurns: u.Turn}
+			}
+			if res.Finished {
+				done <- true
+				return
+			}
+		}
+	}()
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -133,6 +176,8 @@ func distributor(p Params, c distributorChannels) {
 	for {
 		select {
 		case <-call.Done:
+			<-done // wait until every TurnComplete has been sent before sending final turn complete
+
 			if call.Error != nil {
 				fmt.Println("lost connection to server:", call.Error)
 				c.events <- StateChange{lastTurn, Quitting}
